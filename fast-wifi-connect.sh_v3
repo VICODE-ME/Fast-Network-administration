@@ -1,0 +1,480 @@
+#!/bin/bash
+
+# Configuration
+VERSION="3.0"
+LOG_DIR="$HOME/logs"
+LOG_FILE="$LOG_DIR/wifi-connection.log"
+TMP_FILE="/tmp/network_temp.$$"
+CONFIG_DIR="$HOME/.config/fast-wifi"
+SAVED_NETWORKS="$CONFIG_DIR/saved_networks.conf"
+INTERFACE=""
+DEPENDENCIES=("nmcli" "ip" "awk" "grep" "curl" "ss" "ping")
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ASCII Art
+show_banner() {
+    clear
+    echo -e "${BLUE}"
+    cat << "EOF"
+ ███████╗ █████╗ ███████╗████████╗██╗    ██╗██╗███████╗██╗   ██╗
+ ██╔════╝██╔══██╗██╔════╝╚══██╔══╝██║    ██║██║██╔════╝██║   ██║
+ █████╗  ███████║███████╗   ██║   ██║ █╗ ██║██║█████╗  ██║   ██║
+ ██╔══╝  ██╔══██║╚════██║   ██║   ██║███╗██║██║██╔══╝  ╚██╗ ██╔╝
+ ██║     ██║  ██║███████║   ██║   ╚███╔███╔╝██║███████╗ ╚████╔╝ 
+ ╚═╝     ╚═╝  ╚═╝╚══════╝   ╚═╝    ╚══╝╚══╝ ╚═╝╚══════╝  ╚═══╝  
+EOF
+    echo -e "${NC}"
+    echo -e "${YELLOW}Version ${VERSION} - The Ultimate Network Connection Manager${NC}"
+    echo -e "${CYAN}-----------------------------------------------------------${NC}"
+    echo -e "${GREEN}New in v3.0: Enhanced scanner • Better diagnostics • Signal monitor • Troubleshooter${NC}"
+}
+
+# Initial Setup
+init_setup() {
+    mkdir -p "$LOG_DIR" "$CONFIG_DIR"
+    touch "$LOG_FILE"
+    [ ! -f "$SAVED_NETWORKS" ] && touch "$SAVED_NETWORKS"
+    
+    # Initialize network interface
+    INTERFACE=$(ip link | awk -F: '$0 !~ "lo|vir|wl|^[^0-9]"{print $2; exit}' | xargs)
+    [ -z "$INTERFACE" ] && INTERFACE=$(ip link | grep -m1 "state UP" | awk -F: '{print $2}' | xargs)
+}
+
+# Logging System
+log() {
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$timestamp] $1" >> "$LOG_FILE"
+}
+
+# Spinner Animation
+spinner() {
+    local pid=$!
+    local delay=0.1
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+# Check Dependencies
+check_dependencies() {
+    local missing=0
+    for dep in "${DEPENDENCIES[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            echo -e "${RED}Error: Missing dependency - $dep${NC}"
+            ((missing++))
+        fi
+    done
+    
+    if [ "$missing" -gt 0 ]; then
+        echo -e "${YELLOW}Please install missing dependencies and try again.${NC}"
+        exit 1
+    fi
+}
+
+# Enhanced WiFi Scanner
+scan_networks() {
+    echo -e "\n${YELLOW}Scanning available networks...${NC}"
+    nmcli device wifi list
+    # nmcli device wifi list --rescan yes > "$TMP_FILE"
+    (timeout 15s nmcli -f SSID,BARS,SECURITY,CHANNEL device wifi list --rescan yes 2>&1) > "$TMP_FILE" &
+    spinner
+    
+    if [ ! -s "$TMP_FILE" ]; then
+        echo -e "${RED}Scan failed! Possible causes:${NC}"
+        echo "1. WiFi is disabled (check 'rfkill list')"
+        echo "2. Driver issues (run 'lspci -k | grep -A 3 -i network')"
+        echo "3. No networks in range"
+        return 1
+    fi
+
+    echo -e "\n${CYAN}Available Networks:${NC}"
+    printf "%-30s %-10s %-15s %-10s\n" "SSID" "STRENGTH" "SECURITY" "CHANNEL"
+    echo "------------------------------------------------------------------"
+    column -t "$TMP_FILE"
+    log "Network scan completed"
+}
+
+# Smart Password Validation
+validate_password() {
+    local SSID=$1
+    local PASS=$2
+    
+    if [ ${#PASS} -lt 8 ]; then
+        echo -e "${RED}Error: Password must be at least 8 characters${NC}"
+        return 1
+    fi
+    
+    if [[ "$PASS" == "$SSID" ]]; then
+        echo -e "${YELLOW}Warning: Password is the same as SSID${NC}"
+    fi
+    
+    return 0
+}
+
+# Connection with Retry Logic
+connect_with_retry() {
+    local SSID=$1
+    local PASSWORD=$2
+    local RETRIES=3
+    
+    for ((i=1; i<=RETRIES; i++)); do
+        echo -e "\n${YELLOW}Attempt $i/$RETRIES to connect...${NC}"
+        if nmcli device wifi connect "$SSID" password "$PASSWORD"; then
+            echo -e "${GREEN}"
+            figlet -f small "Connected!"
+            echo -e "${NC}"
+            log "SUCCESS: Connected to $SSID after $i attempts"
+            return 0
+        fi
+        sleep 2
+    done
+    
+    echo -e "${RED}Connection failed after $RETRIES attempts${NC}"
+    log "FAILURE: Could not connect to $SSID"
+    return 1
+}
+
+# Connect to WiFi
+connect_wifi() {
+    local SSID=""
+    local PASSWORD=""
+    
+    read -p "Enter WiFi name (SSID): " SSID
+    
+    # Check saved networks first
+    if grep -q "^$SSID:" "$SAVED_NETWORKS"; then
+        PASSWORD=$(grep "^$SSID:" "$SAVED_NETWORKS" | cut -d: -f2)
+        echo -e "${GREEN}Using saved password for $SSID${NC}"
+    else
+        while true; do
+            read -sp "Enter password: " PASSWORD
+            echo
+            validate_password "$SSID" "$PASSWORD" && break
+        done
+        
+        read -p "Save this network? (y/n): " -n 1 SAVE_NETWORK
+        echo
+        if [[ "$SAVE_NETWORK" =~ [yY] ]]; then
+            echo "$SSID:$PASSWORD" >> "$SAVED_NETWORKS"
+            echo -e "${GREEN}Network saved to $SAVED_NETWORKS${NC}"
+        fi
+    fi
+    
+    connect_with_retry "$SSID" "$PASSWORD" && show_diagnostics
+}
+
+# Enhanced Saved Networks Manager
+manage_saved_networks() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}=== Saved Networks Manager ===${NC}"
+        
+        # Current connection status
+        CURRENT_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+        [ -n "$CURRENT_SSID" ] && echo -e "🔌 ${GREEN}Currently connected to: $CURRENT_SSID${NC}\n"
+        
+        # List saved networks
+        if [ ! -s "$SAVED_NETWORKS" ]; then
+            echo -e "${YELLOW}No saved networks found${NC}"
+        else
+            echo -e "${CYAN}📚 Your Saved Networks:${NC}"
+            nl -w2 -s') ' "$SAVED_NETWORKS" | awk -F: '{print $1}'
+        fi
+        
+        # Menu options
+        echo -e "\n${YELLOW}1. Connect to a saved network"
+        echo "2. Forget a network"
+        echo "3. Back to main menu"
+        echo -e "--------------------------------${NC}"
+        
+        read -p "Choose (1-3): " choice
+        case $choice in
+            1)
+                if [ -s "$SAVED_NETWORKS" ]; then
+                    read -p "Enter network number: " num
+                    SSID=$(sed -n "${num}p" "$SAVED_NETWORKS" | cut -d: -f1)
+                    [ -n "$SSID" ] && connect_with_retry "$SSID" "$(grep "^$SSID:" "$SAVED_NETWORKS" | cut -d: -f2)"
+                else
+                    echo -e "${RED}No saved networks!${NC}"
+                fi
+                ;;
+            2)
+                if [ -s "$SAVED_NETWORKS" ]; then
+                    read -p "Enter network number to forget: " num
+                    SSID=$(sed -n "${num}p" "$SAVED_NETWORKS" | cut -d: -f1)
+                    if [ -n "$SSID" ]; then
+                        sed -i "/^$SSID:/d" "$SAVED_NETWORKS"
+                        echo -e "${GREEN}Deleted $SSID from saved networks${NC}"
+                        log "Forgot network: $SSID"
+                    else
+                        echo -e "${RED}Invalid selection${NC}"
+                    fi
+                else
+                    echo -e "${RED}No saved networks!${NC}"
+                fi
+                ;;
+            3) break ;;
+            *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
+        esac
+        read -p "Press Enter to continue..."
+    done
+}
+
+# LAN Management
+manage_lan() {
+    echo -e "\n${MAGENTA}=== LAN Management ===${NC}"
+    
+    [ -z "$INTERFACE" ] && INTERFACE=$(ip link | grep -m1 "state UP" | awk -F: '{print $2}' | xargs)
+    [ -z "$INTERFACE" ] && { echo -e "${RED}No active interface found!${NC}"; return; }
+    
+    local CURRENT_STATE=$(ip link show "$INTERFACE" | grep -o "state [A-Z]*" | awk '{print $2}')
+    echo -e "Interface: ${CYAN}$INTERFACE${NC} (${YELLOW}$CURRENT_STATE${NC})"
+    
+    echo "1. Enable LAN"
+    echo "2. Disable LAN"
+    echo "3. Show LAN Info"
+    echo "4. Back to menu"
+    read -p "Choose option: " CHOICE
+    
+    case $CHOICE in
+        1)
+            sudo ip link set "$INTERFACE" up
+            echo -e "${GREEN}LAN enabled${NC}"
+            log "LAN interface $INTERFACE enabled"
+            ;;
+        2)
+            sudo ip link set "$INTERFACE" down
+            echo -e "${YELLOW}LAN disabled${NC}"
+            log "LAN interface $INTERFACE disabled"
+            ;;
+        3)
+            echo -e "\n${CYAN}Interface Information:${NC}"
+            ip addr show "$INTERFACE"
+            ;;
+        4) return ;;
+        *)
+            echo -e "${RED}Invalid option${NC}"
+            ;;
+    esac
+}
+
+# Enhanced Network Diagnostics
+show_diagnostics() {
+    echo -e "\n${CYAN}=== Network Diagnostics ===${NC}"
+    
+    # Universal IP detection
+    LOCAL_IP4=$(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    LOCAL_IP6=$(ip -o -6 addr show | awk '{print $4}' | head -n1)
+    PUBLIC_IP=$(curl -4 -s ifconfig.me || echo "Not available")
+    
+    # Gateway/DNS with fallbacks
+    GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
+    DNS_SERVERS=$(grep nameserver /etc/resolv.conf | awk '{print $2}' | paste -sd "," -)
+    
+    # Open ports (simplified)
+    OPEN_PORTS=$(ss -tuln | awk 'NR>1 {print $5}' | cut -d: -f2 | sort -un | paste -sd "," -)
+    
+    # Display information
+    printf "%-15s %s\n" "Local IPv4:" "$LOCAL_IP4"
+    printf "%-15s %s\n" "Local IPv6:" "$LOCAL_IP6"
+    printf "%-15s %s\n" "Public IP:" "$PUBLIC_IP"
+    printf "%-15s %s\n" "Gateway:" "$GATEWAY"
+    printf "%-15s %s\n" "DNS Servers:" "$DNS_SERVERS"
+    printf "%-15s %s\n" "Open Ports:" "${OPEN_PORTS:-None}"
+    
+    # Internet test
+    echo -e "\n${YELLOW}Internet Connection:${NC}"
+    if ping -c 2 -W 1 8.8.8.8 >/dev/null 2>&1; then
+        local latency=$(ping -c 2 8.8.8.8 | tail -1 | awk '{print $4}' | cut -d'/' -f2)
+        echo -e "${GREEN}✅ Connected (Latency: ${latency} ms)${NC}"
+    else
+        echo -e "${RED}❌ No connection${NC}"
+    fi
+    
+    log "Diagnostics - Local: $LOCAL_IP4, Public: $PUBLIC_IP"
+}
+
+# Real-Time Signal Monitor
+monitor_signal() {
+    local SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+    if [ -z "$SSID" ]; then
+        echo -e "${RED}Not connected to WiFi!${NC}"
+        return
+    fi
+    
+    echo -e "\n${CYAN}Live Signal Strength for $SSID${NC}"
+    echo -e "${YELLOW}Press Ctrl+C to stop monitoring...${NC}"
+    watch -n 1 -c "nmcli device wifi | grep -E --color=always '$SSID|^'"
+}
+
+# Bandwidth Monitor
+show_bandwidth() {
+    echo -e "\n${CYAN}=== Bandwidth Monitor ===${NC}"
+    
+    if ! command -v iftop >/dev/null; then
+        echo -e "${YELLOW}iftop not installed. Install with:${NC}"
+        echo "sudo pacman -S iftop  # Arch/Garuda"
+        echo "sudo apt install iftop  # Debian/Ubuntu"
+        return
+    fi
+    
+    local iface=$(ip route | grep default | awk '{print $5}')
+    [ -z "$iface" ] && iface=$INTERFACE
+    [ -z "$iface" ] && { echo -e "${RED}No active interface found!${NC}"; return; }
+    
+    echo -e "Monitoring interface: ${YELLOW}$iface${NC}"
+    echo -e "${MAGENTA}Press 'q' to quit iftop${NC}"
+    sleep 2
+    sudo iftop -i "$iface"
+}
+
+# Connection Troubleshooter
+run_troubleshooter() {
+    echo -e "\n${CYAN}=== Network Troubleshooter ===${NC}"
+    
+    # Check physical connection
+    echo -n "Ethernet cable: "
+    ip link | grep -q "state UP" && echo -e "${GREEN}Connected${NC}" || echo -e "${RED}Disconnected${NC}"
+    
+    # Check WiFi
+    echo -n "WiFi adapter: "
+    iw dev | grep -q Interface && echo -e "${GREEN}Active${NC}" || echo -e "${RED}Inactive${NC}"
+    
+    # Check DHCP
+    echo -n "IP Assignment: "
+    ip a | grep -q "inet " && echo -e "${GREEN}OK${NC}" || echo -e "${RED}No IP${NC}"
+    
+    # Check DNS
+    echo -n "DNS Resolution: "
+    if nslookup google.com &>/dev/null; then
+        echo -e "${GREEN}Working${NC}"
+    else
+        echo -e "${RED}Failed${NC}"
+        echo -e "${YELLOW}Try: sudo systemctl restart systemd-resolved${NC}"
+    fi
+    
+    # Check Gateway
+    echo -n "Default Gateway: "
+    if ip route | grep -q default; then
+        echo -e "${GREEN}Found${NC}"
+    else
+        echo -e "${RED}Missing${NC}"
+    fi
+    
+    # Check Internet
+    echo -n "Internet Access: "
+    if ping -c 2 -W 1 8.8.8.8 &>/dev/null; then
+        echo -e "${GREEN}Available${NC}"
+    else
+        echo -e "${RED}Unavailable${NC}"
+    fi
+    
+    log "Ran network troubleshooter"
+}
+
+# QR Code Generator
+generate_qr() {
+    command -v qrencode >/dev/null || {
+        echo -e "${YELLOW}Installing qrencode...${NC}"
+        sudo pacman -S --noconfirm qrencode || sudo apt install -y qrencode
+    }
+    
+    local SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+    if [ -z "$SSID" ]; then
+        echo -e "${RED}No connected WiFi network found${NC}"
+        return
+    fi
+    
+    local PASSWORD=$(grep "^$SSID:" "$SAVED_NETWORKS" | cut -d: -f2)
+    if [ -z "$PASSWORD" ]; then
+        echo -e "${RED}Password not found for $SSID${NC}"
+        echo -e "${YELLOW}Connect manually first to save password${NC}"
+        return
+    fi
+    
+    echo -e "\n${CYAN}QR Code for $SSID:${NC}"
+    qrencode -t ANSIUTF8 "WIFI:S:$SSID;T:WPA;P:$PASSWORD;;"
+    echo -e "${YELLOW}Scan this code to connect automatically${NC}"
+}
+
+# View Logs
+view_logs() {
+    echo -e "\n${CYAN}=== Connection Logs ===${NC}"
+    if [ -s "$LOG_FILE" ]; then
+        less "$LOG_FILE"
+    else
+        echo -e "${YELLOW}No logs found${NC}"
+    fi
+}
+
+# Cleanup on exit
+cleanup() {
+    rm -f "$TMP_FILE"
+    log "Script session ended"
+}
+
+# Main Menu
+main_menu() {
+    while true; do
+        show_banner
+        
+        echo -e "${GREEN}Main Menu:${NC}"
+        echo "1. Scan WiFi Networks"
+        echo "2. Connect to WiFi"
+        echo "3. LAN Management"
+        echo "4. Network Diagnostics"
+        echo "5. Saved Networks"
+        echo "6. Signal Monitor"
+        echo "7. Bandwidth Monitor"
+        echo "8. Troubleshooter"
+        echo "9. Generate WiFi QR"
+        echo "10. View Logs"
+        echo "11. Exit"
+        
+        read -p "Choose an option (1-11): " CHOICE
+        
+        case $CHOICE in
+            1) scan_networks ;;
+            2) connect_wifi ;;
+            3) manage_lan ;;
+            4) show_diagnostics ;;
+            5) manage_saved_networks ;;
+            6) monitor_signal ;;
+            7) show_bandwidth ;;
+            8) run_troubleshooter ;;
+            9) generate_qr ;;
+            10) view_logs ;;
+            11) 
+                echo -e "${GREEN}Exiting...${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option, please try again${NC}"
+                ;;
+        esac
+        
+        echo -e "\nPress Enter to continue..."
+        read
+    done
+}
+
+# Main Execution
+trap cleanup EXIT
+init_setup
+check_dependencies
+log "Script started - version $VERSION"
+main_menu
