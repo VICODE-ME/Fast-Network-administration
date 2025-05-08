@@ -1,0 +1,284 @@
+#!/bin/bash
+
+# Configuration
+VERSION="3.1"
+LOG_DIR="$HOME/logs"
+LOG_FILE="$LOG_DIR/wifi-connection.log"
+TMP_FILE="/tmp/network_temp.$$"
+CONFIG_DIR="$HOME/.config/fast-wifi"
+SAVED_NETWORKS="$CONFIG_DIR/saved_networks.conf"
+INTERFACE=""
+DEPENDENCIES=("nmcli" "ip" "awk" "grep" "curl" "ss" "ping")
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ASCII Art
+show_banner() {
+    clear
+    echo -e "${BLUE}"
+    cat << "EOF"
+ ███████╗ █████╗ ███████╗████████╗██╗    ██╗██╗███████╗██╗   ██╗
+ ██╔════╝██╔══██╗██╔════╝╚══██╔══╝██║    ██║██║██╔════╝██║   ██║
+ █████╗  ███████║███████╗   ██║   ██║ █╗ ██║██║█████╗  ██║   ██║
+ ██╔══╝  ██╔══██║╚════██║   ██║   ██║███╗██║██║██╔══╝  ╚██╗ ██╔╝
+ ██║     ██║  ██║███████║   ██║   ╚███╔███╔╝██║███████╗ ╚████╔╝ 
+ ╚═╝     ╚═╝  ╚═╝╚══════╝   ╚═╝    ╚══╝╚══╝ ╚═╝╚══════╝  ╚═══╝  
+EOF
+    echo -e "${NC}"
+    echo -e "${YELLOW}Version ${VERSION} - The Ultimate Network Connection Manager${NC}"
+    echo -e "${CYAN}-----------------------------------------------------------${NC}"
+    echo -e "${GREEN}New in v3.1: WiFi Adapter Control • Enhanced Error Handling • MAC Filtering${NC}"
+}
+
+# Initial Setup
+init_setup() {
+    mkdir -p "$LOG_DIR" "$CONFIG_DIR"
+    touch "$LOG_FILE"
+    [ ! -f "$SAVED_NETWORKS" ] && touch "$SAVED_NETWORKS"
+    INTERFACE=$(ip link | awk -F: '$0 !~ "lo|vir|wl|^[^0-9]"{print $2; exit}' | xargs)
+}
+
+# Logging System
+log() {
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$timestamp] $1" >> "$LOG_FILE"
+}
+
+# Spinner Animation
+spinner() {
+    local pid=$!
+    local delay=0.1
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\"
+
+    done
+    printf "\b\b\b\b\b\"
+  }
+
+# Enhanced WiFi Scanner
+scan_networks() {
+    echo -e "\n${YELLOW}Scanning available networks...${NC}"
+    (timeout 15s nmcli -f SSID,BARS,SECURITY,CHAN device wifi list --rescan yes 2>&1) > "$TMP_FILE" &
+    spinner
+    
+    if grep -q "Error:" "$TMP_FILE"; then
+        echo -e "${RED}Scan failed!${NC}"
+        grep "Error:" "$TMP_FILE"
+        return 1
+    fi
+
+    echo -e "\n${CYAN}Available Networks:${NC}"
+    printf "%-30s %-10s %-15s %-10s\n" "SSID" "STRENGTH" "SECURITY" "CHANNEL"
+    echo "------------------------------------------------------------------"
+    column -t "$TMP_FILE"
+    log "Network scan completed"
+}
+
+# Smart Password Validation
+validate_password() {
+    local SSID=$1
+    local PASS=$2
+    
+    if [ ${#PASS} -lt 8 ]; then
+        echo -e "${RED}Error: Password must be at least 8 characters${NC}"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Connection with Retry Logic
+connect_with_retry() {
+    local SSID=$1
+    local PASSWORD=$2
+    local RETRIES=3
+    
+    for ((i=1; i<=RETRIES; i++)); do
+        echo -e "\n${YELLOW}Attempt $i/$RETRIES to connect...${NC}"
+        if nmcli device wifi connect "$SSID" password "$PASSWORD"; then
+            echo -e "${GREEN}"
+            figlet -f small "Connected!"
+            echo -e "${NC}"
+            log "SUCCESS: Connected to $SSID after $i attempts"
+            return 0
+        fi
+        sleep 2
+    done
+    
+    echo -e "${RED}Connection failed after $RETRIES attempts${NC}"
+    log "FAILURE: Could not connect to $SSID"
+    return 1
+}
+
+# Improved Connect WiFi
+connect_wifi() {
+    local SSID="" PASSWORD="" attempts=0 max_attempts=5
+    
+    while [ $attempts -lt $max_attempts ]; do
+        read -p "Enter WiFi name (SSID) or 'q' to quit: " SSID
+        [ "$SSID" == "q" ] && return
+        
+        if grep -q "^$SSID:" "$SAVED_NETWORKS"; then
+            PASSWORD=$(grep "^$SSID:" "$SAVED_NETWORKS" | cut -d: -f2)
+            echo -e "${GREEN}Using saved password${NC}"
+            break
+        fi
+        
+        while true; do
+            read -sp "Enter password: " PASSWORD
+            echo
+            validate_password "$SSID" "$PASSWORD" && break
+            ((attempts++))
+            [ $attempts -ge $max_attempts ] && { echo -e "${RED}Max attempts reached!${NC}"; return 1; }
+        done
+        
+        break
+    done
+    
+    connect_with_retry "$SSID" "$PASSWORD" && show_diagnostics
+}
+
+# Enhanced LAN Management
+manage_lan() {
+    echo -e "\n${MAGENTA}=== LAN Management ===${NC}"
+    
+    INTERFACE=$(ip link | awk -F: '$0 !~ "lo|vir|wl|^[^0-9]"{print $2; exit}' | xargs)
+    [ -z "$INTERFACE" ] && { echo -e "${RED}No LAN interface detected!${NC}"; return; }
+    
+    local CURRENT_STATE=$(ip link show "$INTERFACE" | grep -o "state [A-Z]*" | awk '{print $2}')
+    echo -e "Interface: ${CYAN}$INTERFACE${NC}"
+    echo -e "Current State: ${YELLOW}$CURRENT_STATE${NC}"
+    
+    echo "1. Enable LAN"
+    echo "2. Disable LAN"
+    echo "3. Refresh Status"
+    read -p "Choose: " choice
+    
+    case $choice in
+        1) 
+            sudo ip link set "$INTERFACE" up
+            echo -e "${GREEN}LAN enabled${NC}"
+            ip link show "$INTERFACE" | grep "state" ;;
+        2) 
+            sudo ip link set "$INTERFACE" down
+            echo -e "${YELLOW}LAN disabled${NC}" ;;
+        3)
+            echo -e "New State: $(ip link show "$INTERFACE" | grep -o "state [A-Z]*")" ;;
+        *) echo -e "${RED}Invalid option${NC}" ;;
+    esac
+}
+
+# New: WiFi Adapter Control
+manage_wifi_adapter() {
+    echo -e "\n${CYAN}=== WiFi Adapter Control ===${NC}"
+    
+    local wifi_dev=$(nmcli dev | grep wifi | awk '{print $1}')
+    local wifi_status=$(nmcli radio wifi)
+    
+    echo -e "Current Status: ${YELLOW}$wifi_status${NC}"
+    echo "1. Enable WiFi"
+    echo "2. Disable WiFi"
+    echo "3. Restart Adapter"
+    echo "4. Show Detailed Status"
+    read -p "Choose: " choice
+    
+    case $choice in
+        1) 
+            nmcli radio wifi on
+            echo -e "${GREEN}WiFi enabled${NC}" ;;
+        2) 
+            nmcli radio wifi off
+            echo -e "${YELLOW}WiFi disabled${NC}" ;;
+        3)
+            sudo nmcli networking off && sudo nmcli networking on
+            echo -e "${GREEN}Network services restarted${NC}" ;;
+        4)
+            echo -e "\n${CYAN}Adapter Details:${NC}"
+            nmcli dev show "$wifi_dev" ;;
+        *) echo -e "${RED}Invalid option${NC}" ;;
+    esac
+}
+
+# MAC Filtering (New Feature)
+mac_filtering() {
+    echo -e "\n${CYAN}=== MAC Address Filtering ===${NC}"
+    echo "1. Allow specific device"
+    echo "2. Block specific device"
+    read -p "Choose: " choice
+    
+    read -p "Enter MAC address (AA:BB:CC:DD:EE:FF): " mac
+    [[ ! "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && { echo -e "${RED}Invalid MAC format!${NC}"; return; }
+    
+    case $choice in
+        1)
+            sudo iptables -A INPUT -m mac --mac-source "$mac" -j ACCEPT
+            echo -e "${GREEN}Allowed traffic from $mac${NC}" ;;
+        2)
+            sudo iptables -A INPUT -m mac --mac-source "$mac" -j DROP
+            echo -e "${RED}Blocked traffic from $mac${NC}" ;;
+        *)
+            echo -e "${RED}Invalid option${NC}" ;;
+    esac
+}
+
+# Rest of functions remain unchanged (show_diagnostics, manage_saved_networks, etc.)
+
+# Main Menu
+main_menu() {
+    while true; do
+        show_banner
+        
+        echo -e "${GREEN}Main Menu:${NC}"
+        echo "1. Scan WiFi Networks        7. Bandwidth Monitor"
+        echo "2. Connect to WiFi           8. Troubleshooter"
+        echo "3. LAN Management            9. WiFi Adapter Control"
+        echo "4. Network Diagnostics       10. MAC Filtering"
+        echo "5. Saved Networks            11. Generate WiFi QR"
+        echo "6. Signal Monitor            12. Exit"
+        
+        read -p "Choose (1-12): " CHOICE
+        
+        case $CHOICE in
+            1) scan_networks ;;
+            2) connect_wifi ;;
+            3) manage_lan ;;
+            4) show_diagnostics ;;
+            5) manage_saved_networks ;;
+            6) monitor_signal ;;
+            7) show_bandwidth ;;
+            8) run_troubleshooter ;;
+            9) manage_wifi_adapter ;;
+            10) mac_filtering ;;
+            11) generate_qr ;;
+            12) 
+                echo -e "${GREEN}Exiting...${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}Invalid option!${NC}"
+                ;;
+        esac
+        
+        echo -e "\nPress Enter to continue..."
+        read
+    done
+}
+
+# Initialization
+trap cleanup EXIT
+init_setup
+check_dependencies
+log "Script started - version $VERSION"
+main_menu
